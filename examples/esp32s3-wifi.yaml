@@ -31,6 +31,7 @@ wifi:
 logger:
 
 api:
+  reboot_timeout: 0s  # a failover box must not reboot just because HA is unreachable
   encryption:
     key: !secret api_encryption_key
 
