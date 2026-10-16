@@ -1,5 +1,7 @@
 """DHCP/DNS failover for Pi-hole (ESPHome external component)."""
 
+import logging
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import binary_sensor, button, select, sensor, text_sensor
@@ -13,6 +15,8 @@ from esphome.const import (
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@loucks1"]
 DEPENDENCIES = ["network", "time"]
@@ -35,7 +39,9 @@ CONF_POOL_END = "pool_end"
 CONF_LEASE_TIME = "lease_time"
 CONF_DOMAIN = "domain"
 CONF_UPSTREAM_DNS = "upstream_dns"
-CONF_PROBE_INTERVAL = "probe_interval"
+CONF_PROBE_INTERVAL = "probe_interval"  # deprecated alias: fixed interval (min = max)
+CONF_PROBE_INTERVAL_MIN = "probe_interval_min"
+CONF_PROBE_INTERVAL_MAX = "probe_interval_max"
 CONF_FAIL_THRESHOLD = "fail_threshold"
 CONF_RECOVER_THRESHOLD = "recover_threshold"
 CONF_SYNC_TIME = "sync_time"
@@ -51,6 +57,27 @@ CONF_SYNC_STATUS = "sync_status"
 CONF_SYNC_NOW = "sync_now"
 
 OVERRIDE_OPTIONS = ["auto", "force_active", "force_passive"]
+
+
+def _probe_interval(config):
+    if CONF_PROBE_INTERVAL in config:
+        if CONF_PROBE_INTERVAL_MIN in config or CONF_PROBE_INTERVAL_MAX in config:
+            raise cv.Invalid("use either probe_interval (deprecated) or probe_interval_min/max, not both")
+        _LOGGER.warning("dhcp_failover: 'probe_interval' is deprecated; use probe_interval_min/probe_interval_max")
+        config[CONF_PROBE_INTERVAL_MIN] = config[CONF_PROBE_INTERVAL_MAX] = config.pop(CONF_PROBE_INTERVAL)
+    config.setdefault(CONF_PROBE_INTERVAL_MIN, cv.positive_time_period_milliseconds("60s"))
+    config.setdefault(CONF_PROBE_INTERVAL_MAX, cv.positive_time_period_milliseconds("120s"))
+    if config[CONF_PROBE_INTERVAL_MAX].total_milliseconds < config[CONF_PROBE_INTERVAL_MIN].total_milliseconds:
+        raise cv.Invalid("probe_interval_max must be >= probe_interval_min")
+    return config
+
+
+def _consume_sockets(config):
+    from esphome.components import socket
+
+    # DHCP server :67 (also used for probes), DNS server :53, probe/upstream DNS relay
+    socket.consume_sockets(3, "dhcp_failover", socket.SocketType.UDP)(config)
+    return config
 
 
 def _hhmm(value):
@@ -81,7 +108,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_UPSTREAM_DNS, default=["1.1.1.1", "9.9.9.9"]): cv.All(
             cv.ensure_list(cv.ipv4address), cv.Length(min=1, max=2)
         ),
-        cv.Optional(CONF_PROBE_INTERVAL, default="30s"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_PROBE_INTERVAL): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_PROBE_INTERVAL_MIN): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_PROBE_INTERVAL_MAX): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_FAIL_THRESHOLD, default=4): cv.int_range(min=1, max=100),
         cv.Optional(CONF_RECOVER_THRESHOLD, default=3): cv.int_range(min=1, max=100),
         cv.Optional(CONF_SYNC_TIME, default="03:30"): _hhmm,
@@ -115,6 +144,8 @@ CONFIG_SCHEMA = cv.Schema(
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
+CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, _probe_interval, _consume_sockets)
+
 
 def _ip(v):
     a, b, c, d = (int(x) for x in str(v).split("."))
@@ -134,7 +165,8 @@ async def to_code(config):
     cg.add(var.set_domain(config[CONF_DOMAIN]))
     ups = config[CONF_UPSTREAM_DNS]
     cg.add(var.set_upstream(_ip(ups[0]), _ip(ups[1] if len(ups) > 1 else ups[0])))
-    cg.add(var.set_probe(config[CONF_PROBE_INTERVAL].total_milliseconds, config[CONF_FAIL_THRESHOLD],
+    cg.add(var.set_probe(config[CONF_PROBE_INTERVAL_MIN].total_milliseconds,
+                         config[CONF_PROBE_INTERVAL_MAX].total_milliseconds, config[CONF_FAIL_THRESHOLD],
                          config[CONF_RECOVER_THRESHOLD]))
     cg.add(var.set_sync_time(config[CONF_SYNC_TIME][0], config[CONF_SYNC_TIME][1]))
     cg.add(var.set_dns_ttl(config[CONF_DNS_TTL]))

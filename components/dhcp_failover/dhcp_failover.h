@@ -64,8 +64,8 @@ class DhcpFailover : public Component {
   void set_lease_secs(uint32_t s) { this->lease_secs_ = s; }
   void set_domain(const std::string &d) { this->domain_ = d; }
   void set_upstream(uint32_t a, uint32_t b) { this->up1_ = a; this->up2_ = b; }
-  void set_probe(uint32_t interval_ms, uint8_t fails, uint8_t oks) {
-    this->probe_interval_ms_ = interval_ms; this->fail_threshold_ = fails; this->recover_threshold_ = oks;
+  void set_probe(uint32_t min_ms, uint32_t max_ms, uint8_t fails, uint8_t oks) {
+    this->probe_min_ms_ = min_ms; this->probe_max_ms_ = max_ms < min_ms ? min_ms : max_ms; this->fail_threshold_ = fails; this->recover_threshold_ = oks;
   }
   void set_sync_time(uint8_t h, uint8_t m) { this->sync_hour_ = h; this->sync_minute_ = m; }
   void set_dns_ttl(uint32_t t) { this->dns_ttl_ = t; }
@@ -138,7 +138,7 @@ class DhcpFailover : public Component {
   uint32_t pihole_ip_{0}, self_ip_{0}, gateway_{0}, netmask_{0}, pool_start_{0}, pool_end_{0}, up1_{0}, up2_{0};
   uint16_t pihole_port_{80};
   std::string pihole_password_, domain_{"lan"};
-  uint32_t lease_secs_{600}, probe_interval_ms_{30000}, dns_ttl_{60};
+  uint32_t lease_secs_{600}, probe_min_ms_{60000}, probe_max_ms_{120000}, next_probe_ms_{0}, dns_ttl_{60};
   uint8_t fail_threshold_{4}, recover_threshold_{3}, sync_hour_{3}, sync_minute_{30};
 
   text_sensor::TextSensor *mode_ts_{nullptr}, *sync_status_ts_{nullptr}, *last_sync_ts_{nullptr};

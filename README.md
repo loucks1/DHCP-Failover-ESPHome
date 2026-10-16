@@ -9,10 +9,10 @@ over `ethernet:` (RMII or SPI such as W5500) or `wifi:`.
 
 ## How it works
 
-* **Passive (default).** Nothing listens on UDP 67 or 53. Every `probe_interval` (30s), the device broadcasts a
+* **Passive (default).** Nothing listens on UDP 67 or 53. Every `probe_interval_min`–`probe_interval_max` (a random 60–120s, picked fresh with `esp_random()` for each probe), the device broadcasts a
   DHCPDISCOVER from a fake, locally administered MAC (`02:00:5E:D1:0C:F0`). Only an OFFER whose
   server-identifier is `pihole_ip` counts as healthy.
-* **Failover.** After `fail_threshold` (4) failed probes in a row (about 2 minutes), the device goes **active**:
+* **Failover.** After `fail_threshold` (4) failed probes in a row (about 4–8 minutes with the default 60–120s interval), the device goes **active**:
   * **DHCP on :67.** A client with a Pi-hole reservation gets that IP. A client with a known Pi-hole lease, or a lease from
     this device, keeps its IP. Anyone else gets an address from `pool_start`–`pool_end` (.210–.249). Leases are short
     (`lease_time`, 10 min), and the device hands itself out as DNS.
@@ -88,7 +88,7 @@ gitignored.
 | Key | Default |
 |---|---|
 | `pihole_ip` | `192.168.86.10` |
-| `pihole_port` | `80` |
+| `pihole_port` | `80` (Pi-hole v6's web/API is often on `8080`; check the URL you use for the admin UI) |
 | `pihole_password` | **required** (Pi-hole app password) |
 | `address` | auto-detected (this device's static IP) |
 | `gateway` / `netmask` | `192.168.86.1` / `255.255.255.0` |
@@ -96,7 +96,8 @@ gitignored.
 | `lease_time` | `10min` |
 | `domain` | `lan` |
 | `upstream_dns` | `[1.1.1.1, 9.9.9.9]` |
-| `probe_interval` | `30s` |
+| `probe_interval_min` / `probe_interval_max` | `60s` / `120s` (random wait between probes) |
+| `probe_interval` | deprecated; sets a fixed interval (min = max) |
 | `fail_threshold` / `recover_threshold` | `4` / `3` |
 | `sync_time` | `"03:30"` (local time from `time_id`) |
 | `dns_ttl` | `60` |

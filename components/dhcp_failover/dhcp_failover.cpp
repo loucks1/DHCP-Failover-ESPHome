@@ -124,7 +124,8 @@ void DhcpFailover::dump_config() {
   ESP_LOGCONFIG(TAG, "  Pool: %s - %s, lease %us, domain '%s'", ip_str(this->pool_start_).c_str(),
                 ip_str(this->pool_end_).c_str(), (unsigned) this->lease_secs_, this->domain_.c_str());
   ESP_LOGCONFIG(TAG, "  Upstream DNS: %s, %s", ip_str(this->up1_).c_str(), ip_str(this->up2_).c_str());
-  ESP_LOGCONFIG(TAG, "  Probe every %ums; %u fails -> active, %u ok -> passive", (unsigned) this->probe_interval_ms_,
+  ESP_LOGCONFIG(TAG, "  Probe every %u-%ums (random); %u fails -> active, %u ok -> passive",
+                (unsigned) this->probe_min_ms_, (unsigned) this->probe_max_ms_,
                 this->fail_threshold_, this->recover_threshold_);
   ESP_LOGCONFIG(TAG, "  Nightly sync %02u:%02u; override %s", this->sync_hour_, this->sync_minute_,
                 OPTS[this->override_]);
@@ -524,8 +525,11 @@ void DhcpFailover::probe_loop_() {
                (unsigned) this->consec_ok_);
       if (was != (this->consec_fail_ == 0) || this->consec_ok_ == 1 || this->consec_fail_ == 1) this->publish_status_();
     }
-  } else if (this->last_probe_ms_ == 0 || millis() - this->last_probe_ms_ > this->probe_interval_ms_) {
+  } else if (this->last_probe_ms_ == 0 || millis() - this->last_probe_ms_ > this->next_probe_ms_) {
     this->last_probe_ms_ = millis();
+    uint32_t span = this->probe_max_ms_ - this->probe_min_ms_;
+    this->next_probe_ms_ = this->probe_min_ms_ + (span ? esp_random() % (span + 1) : 0);
+    ESP_LOGD(TAG, "probe: next in %ums", (unsigned) this->next_probe_ms_);
     this->send_probe_();
   }
 }
@@ -784,8 +788,9 @@ void DhcpFailover::sync_worker_() {
   };
   if (ok) {
     JsonDocument d;
-    if ((ok = get("/api/config/dhcp/hosts", d)))
-      for (const char *s : d["config"]["dhcp"]["hosts"].as<JsonArray>()) {
+    if ((ok = get("/api/config/dhcp/hosts", d))) {
+      JsonArray hosts = d["config"]["dhcp"]["hosts"].as<JsonArray>();
+      for (const char *s : hosts) {
         if (!s) continue;
         // dnsmasq dhcp-host style "MAC,IP,name[,lease]" (order may vary). Skip without MAC+IP.
         Res r{};
@@ -809,22 +814,26 @@ void DhcpFailover::sync_worker_() {
         }
         if (has_mac && r.ip && this->in_subnet_(r.ip)) res.push_back(r);
       }
+    }
   }
   if (ok) {
     JsonDocument d;
-    if ((ok = get("/api/dhcp/leases", d)))
-      for (JsonObject l : d["leases"].as<JsonArray>()) {
+    if ((ok = get("/api/dhcp/leases", d))) {
+      JsonArray lease_arr = d["leases"].as<JsonArray>();
+      for (JsonObject l : lease_arr) {
         Res r{};
         const char *nm = l["name"] | "";
         if (!parse_mac(l["hwaddr"] | "", r.mac) || !parse_ip(l["ip"] | "", &r.ip) || !this->in_subnet_(r.ip)) continue;
         r.name = strcmp(nm, "*") ? nm : "";
         leases.push_back(r);
       }
+    }
   }
   if (ok) {
     JsonDocument d;
-    if ((ok = get("/api/config/dns/hosts", d)))
-      for (const char *s : d["config"]["dns"]["hosts"].as<JsonArray>()) {
+    if ((ok = get("/api/config/dns/hosts", d))) {
+      JsonArray dns_hosts = d["config"]["dns"]["hosts"].as<JsonArray>();
+      for (const char *s : dns_hosts) {
         if (!s) continue;
         char buf[256];
         strncpy(buf, s, sizeof buf - 1);
@@ -840,6 +849,7 @@ void DhcpFailover::sync_worker_() {
           dns.push_back(r);
         }
       }
+    }
   }
   if (!sid.empty()) this->http_("DELETE", "/api/auth", sid, "", out, st);  // free the session slot
 

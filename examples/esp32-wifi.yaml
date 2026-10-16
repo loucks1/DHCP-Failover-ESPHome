@@ -35,7 +35,8 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:
+      key: !secret api_encryption_key   # same key as api; must match
 
 web_server:   # optional
   port: 80
@@ -50,6 +51,7 @@ dhcp_failover:
   time_id: sntp_time
   address: 192.168.86.11            # must equal ethernet static_ip
   pihole_ip: 192.168.86.10
+  # pihole_port: 80        # Pi-hole v6 web/API port; often 8080 when another web server owns :80
   pihole_password: !secret pihole_app_password
   gateway: 192.168.86.1
   netmask: 255.255.255.0
@@ -58,7 +60,8 @@ dhcp_failover:
   lease_time: 10min
   domain: lan
   upstream_dns: [1.1.1.1, 9.9.9.9]
-  probe_interval: 30s
+  probe_interval_min: 60s   # each probe waits a random time in [min, max]
+  probe_interval_max: 120s
   fail_threshold: 4
   recover_threshold: 3
   sync_time: "03:30"
