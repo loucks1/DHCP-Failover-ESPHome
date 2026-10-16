@@ -1,0 +1,78 @@
+# DHCP/DNS failover for Pi-hole on a WT32-ETH01 (ESP32 + LAN8720 Ethernet).
+substitutions:
+  name: esp32-dhcp
+  friendly_name: DHCP Failover
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://loucks1/DHCP-Failover-ESPHome
+    components: [dhcp_failover]
+
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk:
+    mode: CLK_EXT_IN
+    pin: GPIO0
+  phy_addr: 1
+  power_pin: GPIO16
+  manual_ip:
+    static_ip: 192.168.86.11
+    gateway: 192.168.86.1
+    subnet: 255.255.255.0
+    dns1: 192.168.86.10
+    dns2: 1.1.1.1
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:   # optional
+  port: 80
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Chicago
+    servers: [pool.ntp.org, time.cloudflare.com, 162.159.200.1]
+
+dhcp_failover:
+  time_id: sntp_time
+  address: 192.168.86.11            # must equal ethernet static_ip
+  pihole_ip: 192.168.86.10
+  pihole_password: !secret pihole_app_password
+  gateway: 192.168.86.1
+  netmask: 255.255.255.0
+  pool_start: 192.168.86.210
+  pool_end: 192.168.86.249
+  lease_time: 10min
+  domain: lan
+  upstream_dns: [1.1.1.1, 9.9.9.9]
+  probe_interval: 30s
+  fail_threshold: 4
+  recover_threshold: 3
+  sync_time: "03:30"
+  # Entities (all optional; defaults shown)
+  mode: { name: Mode }
+  override: { name: Override }
+  pihole_dhcp_healthy: { name: Pi-hole DHCP Healthy }
+  reservation_count: { name: Reservations }
+  active_lease_count: { name: Active Leases }
+  last_sync: { name: Last Sync }
+  sync_status: { name: Sync Status }
+  sync_now: { name: Sync Now }
