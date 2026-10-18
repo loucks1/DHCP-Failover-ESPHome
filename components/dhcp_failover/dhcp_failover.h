@@ -1,6 +1,7 @@
 #pragma once
-// DHCP/DNS failover for Pi-hole. Passive (silent on UDP 67/53) while Pi-hole answers
-// DHCP; active (serves DHCP + DNS) after `fail_threshold` failed probes.
+// DHCP/DNS failover for Pi-hole. Passive (silent on UDP 67/53) while Pi-hole passes its
+// health probe (a DNS query sent straight to Pi-hole by default, or a DHCPDISCOVER in
+// probe_mode: dhcp); active (serves DHCP + DNS) after `fail_threshold` failed probes.
 #include <string>
 #include <vector>
 #include "esphome/core/component.h"
@@ -40,6 +41,7 @@ struct Pending {
 };
 
 enum Override : uint8_t { OV_AUTO = 0, OV_FORCE_ACTIVE, OV_FORCE_PASSIVE };
+enum ProbeMode : uint8_t { PROBE_DNS = 0, PROBE_DHCP };
 
 class DhcpFailover;
 
@@ -66,6 +68,11 @@ class DhcpFailover : public Component {
   void set_upstream(uint32_t a, uint32_t b) { this->up1_ = a; this->up2_ = b; }
   void set_probe(uint32_t min_ms, uint32_t max_ms, uint8_t fails, uint8_t oks) {
     this->probe_min_ms_ = min_ms; this->probe_max_ms_ = max_ms < min_ms ? min_ms : max_ms; this->fail_threshold_ = fails; this->recover_threshold_ = oks;
+  }
+  void set_probe_retry_ms(uint32_t ms) { this->probe_retry_ms_ = ms; }
+  void set_probe_mode(ProbeMode m) { this->probe_mode_ = m; }
+  void set_probe_dns(uint32_t server, const std::string &name, uint32_t timeout_ms) {
+    this->probe_dns_server_ = server; this->probe_dns_name_ = name; this->probe_dns_timeout_ms_ = timeout_ms;
   }
   void set_sync_time(uint8_t h, uint8_t m) { this->sync_hour_ = h; this->sync_minute_ = m; }
   void set_dns_ttl(uint32_t t) { this->dns_ttl_ = t; }
@@ -117,7 +124,11 @@ class DhcpFailover : public Component {
   void dhcp_loop_();
   void dhcp_handle_(const uint8_t *b, int n);
   void dhcp_reply_(const uint8_t *q, uint8_t type, uint32_t yiaddr, bool with_lease);
-  void send_probe_();
+  void send_probe_();         // DHCP mode
+  void send_dns_probe_();     // DNS mode
+  void probe_recv_dhcp_();
+  void probe_recv_dns_();
+  void probe_done_(bool ok, const char *detail);
   void probe_loop_();
   // dns
   void dns_begin_();
@@ -139,6 +150,9 @@ class DhcpFailover : public Component {
   uint16_t pihole_port_{80};
   std::string pihole_password_, domain_{"lan"};
   uint32_t lease_secs_{600}, probe_min_ms_{60000}, probe_max_ms_{120000}, next_probe_ms_{0}, dns_ttl_{60};
+  uint32_t probe_retry_ms_{5000}, probe_dns_server_{0}, probe_dns_timeout_ms_{2000};
+  ProbeMode probe_mode_{PROBE_DNS};
+  std::string probe_dns_name_{"proxmox1.lan"};
   uint8_t fail_threshold_{4}, recover_threshold_{3}, sync_hour_{3}, sync_minute_{30};
 
   text_sensor::TextSensor *mode_ts_{nullptr}, *sync_status_ts_{nullptr}, *last_sync_ts_{nullptr};
@@ -160,8 +174,10 @@ class DhcpFailover : public Component {
 
   int srv_{-1}, prb_{-1}, s53_{-1}, up_{-1};
   Pending pend_[8];
-  uint32_t probe_xid_{0}, probe_sent_ms_{0}, last_probe_ms_{0};
-  bool probe_waiting_{false}, got_offer_{false};
+  uint32_t probe_xid_{0}, probe_sent_ms_{0}, last_probe_ms_{0}, last_probe_latency_ms_{0};
+  bool probe_waiting_{false}, got_offer_{false}, probe_ever_{false};
+  uint8_t probe_q_[300];      // last DNS probe query (to match the echoed question)
+  uint16_t probe_qlen_{0};
 
   bool sync_requested_{false}, boot_synced_{false}, last_sync_ok_{false};
   uint32_t last_sync_try_ms_{0}, last_status_ms_{0};

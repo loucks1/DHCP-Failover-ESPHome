@@ -70,15 +70,20 @@ dhcp_failover:
   lease_time: 10min
   domain: lan
   upstream_dns: [1.1.1.1, 9.9.9.9]
-  probe_interval_min: 60s   # each probe waits a random time in [min, max]
+  probe_mode: dns           # health check = DNS query sent straight to Pi-hole (or: dhcp)
+  probe_dns_name: proxmox1.lan   # a name Pi-hole always answers locally
+  # probe_dns_server: 192.168.86.10   # defaults to pihole_ip; never this device
+  # probe_dns_timeout: 2s
+  probe_interval_min: 60s   # while healthy, each probe waits a random time in [min, max]
   probe_interval_max: 120s
-  fail_threshold: 4
-  recover_threshold: 3
+  probe_retry_interval: 5s  # after a failed probe, and the whole time we're active
+  fail_threshold: 2         # failed probes in a row -> active
+  recover_threshold: 2      # good probes in a row -> passive again
   sync_time: "03:30"
   # Entities (all optional; defaults shown)
   mode: { name: Mode }
   override: { name: Override }
-  pihole_dhcp_healthy: { name: Pi-hole DHCP Healthy }
+  pihole_dhcp_healthy: { name: Pi-hole DHCP Healthy }   # name kept for compatibility; follows the probe in either mode
   reservation_count: { name: Reservations }
   active_lease_count: { name: Active Leases }
   last_sync: { name: Last Sync }

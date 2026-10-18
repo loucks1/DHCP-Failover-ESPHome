@@ -42,6 +42,11 @@ CONF_UPSTREAM_DNS = "upstream_dns"
 CONF_PROBE_INTERVAL = "probe_interval"  # deprecated alias: fixed interval (min = max)
 CONF_PROBE_INTERVAL_MIN = "probe_interval_min"
 CONF_PROBE_INTERVAL_MAX = "probe_interval_max"
+CONF_PROBE_RETRY_INTERVAL = "probe_retry_interval"
+CONF_PROBE_MODE = "probe_mode"
+CONF_PROBE_DNS_NAME = "probe_dns_name"
+CONF_PROBE_DNS_SERVER = "probe_dns_server"
+CONF_PROBE_DNS_TIMEOUT = "probe_dns_timeout"
 CONF_FAIL_THRESHOLD = "fail_threshold"
 CONF_RECOVER_THRESHOLD = "recover_threshold"
 CONF_SYNC_TIME = "sync_time"
@@ -57,6 +62,27 @@ CONF_SYNC_STATUS = "sync_status"
 CONF_SYNC_NOW = "sync_now"
 
 OVERRIDE_OPTIONS = ["auto", "force_active", "force_passive"]
+ProbeMode = ns.enum("ProbeMode")
+PROBE_MODES = {"dns": ProbeMode.PROBE_DNS, "dhcp": ProbeMode.PROBE_DHCP}
+
+
+def _dns_name(value):
+    value = cv.string_strict(value).strip().rstrip(".").lower()
+    if not value or len(value) > 253:
+        raise cv.Invalid("probe_dns_name must be 1-253 characters")
+    for label in value.split("."):
+        if not 1 <= len(label) <= 63:
+            raise cv.Invalid(f"probe_dns_name: bad label '{label}'")
+        if not all(c.isalnum() or c in "-_" for c in label):
+            raise cv.Invalid(f"probe_dns_name: invalid character in '{label}'")
+    return value
+
+
+def _probe_dns_server(config):
+    config.setdefault(CONF_PROBE_DNS_SERVER, config[CONF_PIHOLE_IP])
+    if CONF_ADDRESS in config and str(config[CONF_PROBE_DNS_SERVER]) == str(config[CONF_ADDRESS]):
+        raise cv.Invalid("probe_dns_server must be Pi-hole, not this device (it serves DNS itself when active)")
+    return config
 
 
 def _probe_interval(config):
@@ -75,8 +101,8 @@ def _probe_interval(config):
 def _consume_sockets(config):
     from esphome.components import socket
 
-    # DHCP server :67 (also used for probes), DNS server :53, probe/upstream DNS relay
-    socket.consume_sockets(3, "dhcp_failover", socket.SocketType.UDP)(config)
+    # DHCP server :67, DNS server :53, upstream DNS relay, health probe (DNS: ephemeral port; DHCP: :68)
+    socket.consume_sockets(4, "dhcp_failover", socket.SocketType.UDP)(config)
     return config
 
 
@@ -111,6 +137,16 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_PROBE_INTERVAL): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_PROBE_INTERVAL_MIN): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_PROBE_INTERVAL_MAX): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_PROBE_RETRY_INTERVAL, default="5s"): cv.All(
+            cv.positive_time_period_milliseconds, cv.Range(min=cv.TimePeriod(seconds=1))
+        ),
+        cv.Optional(CONF_PROBE_MODE, default="dns"): cv.enum(PROBE_MODES, lower=True),
+        cv.Optional(CONF_PROBE_DNS_NAME, default="proxmox1.lan"): _dns_name,
+        cv.Optional(CONF_PROBE_DNS_SERVER): cv.ipv4address,
+        cv.Optional(CONF_PROBE_DNS_TIMEOUT, default="2s"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(min=cv.TimePeriod(milliseconds=200), max=cv.TimePeriod(seconds=10)),
+        ),
         cv.Optional(CONF_FAIL_THRESHOLD, default=4): cv.int_range(min=1, max=100),
         cv.Optional(CONF_RECOVER_THRESHOLD, default=3): cv.int_range(min=1, max=100),
         cv.Optional(CONF_SYNC_TIME, default="03:30"): _hhmm,
@@ -144,7 +180,7 @@ CONFIG_SCHEMA = cv.Schema(
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
-CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, _probe_interval, _consume_sockets)
+CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, _probe_interval, _probe_dns_server, _consume_sockets)
 
 
 def _ip(v):
@@ -168,6 +204,10 @@ async def to_code(config):
     cg.add(var.set_probe(config[CONF_PROBE_INTERVAL_MIN].total_milliseconds,
                          config[CONF_PROBE_INTERVAL_MAX].total_milliseconds, config[CONF_FAIL_THRESHOLD],
                          config[CONF_RECOVER_THRESHOLD]))
+    cg.add(var.set_probe_retry_ms(config[CONF_PROBE_RETRY_INTERVAL].total_milliseconds))
+    cg.add(var.set_probe_mode(config[CONF_PROBE_MODE]))
+    cg.add(var.set_probe_dns(_ip(config[CONF_PROBE_DNS_SERVER]), config[CONF_PROBE_DNS_NAME],
+                             config[CONF_PROBE_DNS_TIMEOUT].total_milliseconds))
     cg.add(var.set_sync_time(config[CONF_SYNC_TIME][0], config[CONF_SYNC_TIME][1]))
     cg.add(var.set_dns_ttl(config[CONF_DNS_TTL]))
 

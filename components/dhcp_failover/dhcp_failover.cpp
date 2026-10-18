@@ -23,7 +23,7 @@ namespace esphome::dhcp_failover {
 static const char *const TAG = "dhcp_failover";
 static const uint8_t PROBE_MAC[6] = {0x02, 0x00, 0x5E, 0xD1, 0x0C, 0xF0};  // locally administered, fake
 static const uint8_t COOKIE[4] = {99, 130, 83, 99};
-static const uint32_t PROBE_TIMEOUT_MS = 5000;  // dnsmasq may ping-check before OFFER
+static const uint32_t PROBE_TIMEOUT_MS = 5000;  // DHCP mode: dnsmasq may ping-check before OFFER
 static const uint32_t SYNC_RETRY_MS = 15UL * 60 * 1000;
 static const char *const OPTS[] = {"auto", "force_active", "force_passive"};
 enum { DISCOVER = 1, OFFER, REQUEST, DECLINE, ACK, NAK, RELEASE, INFORM };
@@ -124,9 +124,17 @@ void DhcpFailover::dump_config() {
   ESP_LOGCONFIG(TAG, "  Pool: %s - %s, lease %us, domain '%s'", ip_str(this->pool_start_).c_str(),
                 ip_str(this->pool_end_).c_str(), (unsigned) this->lease_secs_, this->domain_.c_str());
   ESP_LOGCONFIG(TAG, "  Upstream DNS: %s, %s", ip_str(this->up1_).c_str(), ip_str(this->up2_).c_str());
-  ESP_LOGCONFIG(TAG, "  Probe every %u-%ums (random); %u fails -> active, %u ok -> passive",
-                (unsigned) this->probe_min_ms_, (unsigned) this->probe_max_ms_,
-                this->fail_threshold_, this->recover_threshold_);
+  if (this->probe_mode_ == PROBE_DNS)
+    ESP_LOGCONFIG(TAG, "  Probe mode: dns (A %s @ %s:53 direct, timeout %ums)", this->probe_dns_name_.c_str(),
+                  ip_str(this->probe_dns_server_).c_str(), (unsigned) this->probe_dns_timeout_ms_);
+  else
+    ESP_LOGCONFIG(TAG, "  Probe mode: dhcp (DISCOVER, OFFER from %s, timeout %ums)", ip_str(this->pihole_ip_).c_str(),
+                  (unsigned) PROBE_TIMEOUT_MS);
+  ESP_LOGCONFIG(TAG, "  Probe every %u-%ums (random) while healthy, every %ums after a failure or while active",
+                (unsigned) this->probe_min_ms_, (unsigned) this->probe_max_ms_, (unsigned) this->probe_retry_ms_);
+  ESP_LOGCONFIG(TAG, "  %u fails -> active, %u ok -> passive", this->fail_threshold_, this->recover_threshold_);
+  if (this->probe_mode_ == PROBE_DNS && this->self_ip_ != 0 && this->probe_dns_server_ == this->self_ip_)
+    ESP_LOGE(TAG, "  probe_dns_server is THIS device; probes disabled. Point it at Pi-hole.");
   ESP_LOGCONFIG(TAG, "  Nightly sync %02u:%02u; override %s", this->sync_hour_, this->sync_minute_,
                 OPTS[this->override_]);
 }
@@ -161,8 +169,10 @@ void DhcpFailover::loop() {
 
   if (this->override_ == OV_FORCE_ACTIVE) this->set_active_(true, "forced");
   else if (this->override_ == OV_FORCE_PASSIVE) this->set_active_(false, "forced");
-  else if (!this->active_ && this->consec_fail_ >= this->fail_threshold_) this->set_active_(true, "Pi-hole DHCP not answering");
-  else if (this->active_ && this->consec_ok_ >= this->recover_threshold_) this->set_active_(false, "Pi-hole DHCP back");
+  else if (!this->active_ && this->consec_fail_ >= this->fail_threshold_)
+    this->set_active_(true, this->probe_mode_ == PROBE_DNS ? "Pi-hole DNS not answering" : "Pi-hole DHCP not answering");
+  else if (this->active_ && this->consec_ok_ >= this->recover_threshold_)
+    this->set_active_(false, this->probe_mode_ == PROBE_DNS ? "Pi-hole DNS back" : "Pi-hole DHCP back");
 
   if (this->active_) {
     this->dhcp_loop_();
@@ -483,7 +493,8 @@ void DhcpFailover::dhcp_loop_() {
   }
 }
 
-// ------------------------------------------------------------ Pi-hole DHCP probe
+// ------------------------------------------------------------ Pi-hole health probe
+// DHCP mode: broadcast DHCPDISCOVER from a fake MAC; healthy = OFFER whose server-id is pihole_ip.
 void DhcpFailover::send_probe_() {
   uint8_t b[300] = {};
   b[0] = 1; b[1] = 1; b[2] = 6;
@@ -502,8 +513,7 @@ void DhcpFailover::send_probe_() {
   this->got_offer_ = false;
 }
 
-void DhcpFailover::probe_loop_() {
-  if (this->prb_ < 0) { this->prb_ = udp_sock(68, true); if (this->prb_ < 0) return; }
+void DhcpFailover::probe_recv_dhcp_() {
   uint8_t b[600];
   int n;
   while ((n = recv(this->prb_, b, sizeof b, 0)) > 0) {
@@ -512,25 +522,124 @@ void DhcpFailover::probe_loop_() {
     int l = 0, l2 = 0;
     const uint8_t *p = opt(b, n, 53, &l);
     const uint8_t *s = opt(b, n, 54, &l2);
-    if (p && l == 1 && p[0] == OFFER && s && l2 == 4 && rd32(s) == this->pihole_ip_) this->got_offer_ = true;
-  }
-  if (this->probe_waiting_) {
-    if (this->got_offer_ || millis() - this->probe_sent_ms_ > PROBE_TIMEOUT_MS) {
-      this->probe_waiting_ = false;
-      bool was = this->consec_fail_ == 0 && this->healthy_known_;
-      if (this->got_offer_) { this->consec_ok_++; this->consec_fail_ = 0; }
-      else { this->consec_fail_++; this->consec_ok_ = 0; }
-      this->healthy_known_ = true;
-      ESP_LOGD(TAG, "probe: offer=%d -> fail=%u ok=%u", this->got_offer_, (unsigned) this->consec_fail_,
-               (unsigned) this->consec_ok_);
-      if (was != (this->consec_fail_ == 0) || this->consec_ok_ == 1 || this->consec_fail_ == 1) this->publish_status_();
+    if (p && l == 1 && p[0] == OFFER && s && l2 == 4 && rd32(s) == this->pihole_ip_) {
+      this->got_offer_ = true;
+      this->probe_done_(true, "OFFER");
     }
-  } else if (this->last_probe_ms_ == 0 || millis() - this->last_probe_ms_ > this->next_probe_ms_) {
-    this->last_probe_ms_ = millis();
+  }
+}
+
+// DNS mode: unicast "A <probe_dns_name>" straight to probe_dns_server:53 from an ephemeral port (never via the
+// board's own resolver, never to itself). Healthy = reply from that server:53 with our ID and question,
+// RCODE NOERROR and >= 1 answer, within probe_dns_timeout.
+void DhcpFailover::send_dns_probe_() {
+  uint8_t *q = this->probe_q_;
+  uint16_t id = (uint16_t) esp_random();
+  q[0] = id >> 8; q[1] = id;
+  q[2] = 0x01; q[3] = 0x00;          // RD
+  q[4] = 0; q[5] = 1;                // QDCOUNT 1
+  q[6] = q[7] = q[8] = q[9] = q[10] = q[11] = 0;
+  int i = 12;
+  const std::string &nm = this->probe_dns_name_;
+  size_t start = 0;
+  while (start < nm.size()) {
+    size_t dot = nm.find('.', start);
+    if (dot == std::string::npos) dot = nm.size();
+    size_t l = dot - start;
+    if (l == 0 || l > 63 || i + 1 + (int) l + 5 > (int) sizeof this->probe_q_) break;
+    q[i++] = (uint8_t) l;
+    memcpy(q + i, nm.data() + start, l);
+    i += l;
+    start = dot + 1;
+  }
+  q[i++] = 0;
+  q[i++] = 0; q[i++] = 1;            // QTYPE A
+  q[i++] = 0; q[i++] = 1;            // QCLASS IN
+  this->probe_qlen_ = i;
+  send_to(this->prb_, q, i, this->probe_dns_server_, 53);
+  this->probe_sent_ms_ = millis();
+  this->probe_waiting_ = true;
+  this->got_offer_ = false;
+}
+
+void DhcpFailover::probe_recv_dns_() {
+  uint8_t b[600];
+  sockaddr_in from;
+  socklen_t fl = sizeof from;
+  int n;
+  while ((n = recvfrom(this->prb_, b, sizeof b, 0, (sockaddr *) &from, &fl)) > 0) {
+    fl = sizeof from;
+    if (!this->probe_waiting_ || n < this->probe_qlen_ || n < 12) continue;
+    if (ntohl(from.sin_addr.s_addr) != this->probe_dns_server_ || ntohs(from.sin_port) != 53) continue;
+    if (b[0] != this->probe_q_[0] || b[1] != this->probe_q_[1] || !(b[2] & 0x80)) continue;  // ID, QR
+    if (((b[4] << 8) | b[5]) != 1) continue;
+    bool same_q = true;  // question echoed (case-insensitive, for servers that randomize 0x20 case)
+    for (int k = 12; k < this->probe_qlen_ && same_q; k++) same_q = tolower(b[k]) == tolower(this->probe_q_[k]);
+    if (!same_q) continue;
+    uint8_t rcode = b[3] & 0x0F;
+    unsigned an = (b[6] << 8) | b[7];
+    char detail[32];
+    snprintf(detail, sizeof detail, "rcode=%u answers=%u", (unsigned) rcode, an);
+    this->probe_done_(rcode == 0 && an >= 1, detail);
+  }
+}
+
+void DhcpFailover::probe_done_(bool ok, const char *detail) {
+  const char *mode = this->probe_mode_ == PROBE_DNS ? "dns" : "dhcp";
+  this->probe_waiting_ = false;
+  this->last_probe_latency_ms_ = millis() - this->probe_sent_ms_;
+  bool was = this->consec_fail_ == 0 && this->healthy_known_;
+  if (ok) { this->consec_ok_++; this->consec_fail_ = 0; }
+  else { this->consec_fail_++; this->consec_ok_ = 0; }
+  this->healthy_known_ = true;
+  // Next probe, measured from now: random min..max while passive and healthy; probe_retry_interval after a
+  // failure (to confirm fast) and all the time while active (to hand back fast).
+  this->last_probe_ms_ = millis();
+  if (this->active_ || this->consec_fail_ > 0) {
+    this->next_probe_ms_ = this->probe_retry_ms_;
+  } else {
     uint32_t span = this->probe_max_ms_ - this->probe_min_ms_;
     this->next_probe_ms_ = this->probe_min_ms_ + (span ? esp_random() % (span + 1) : 0);
-    ESP_LOGD(TAG, "probe: next in %ums", (unsigned) this->next_probe_ms_);
-    this->send_probe_();
+  }
+  if (ok) {
+    if (!was)
+      ESP_LOGI(TAG, "probe %s ok (%s) in %ums; ok %u/%u; next in %ums", mode, detail,
+               (unsigned) this->last_probe_latency_ms_, (unsigned) this->consec_ok_, this->recover_threshold_,
+               (unsigned) this->next_probe_ms_);
+    else
+      ESP_LOGD(TAG, "probe %s ok (%s) in %ums; next in %ums", mode, detail, (unsigned) this->last_probe_latency_ms_,
+               (unsigned) this->next_probe_ms_);
+  } else if (this->consec_fail_ <= this->fail_threshold_) {
+    ESP_LOGW(TAG, "probe %s FAILED (%s) after %ums; fail %u/%u; retry in %ums", mode, detail,
+             (unsigned) this->last_probe_latency_ms_, (unsigned) this->consec_fail_, this->fail_threshold_,
+             (unsigned) this->next_probe_ms_);
+  } else {
+    ESP_LOGD(TAG, "probe %s still failing (%s); fail %u", mode, detail, (unsigned) this->consec_fail_);
+  }
+  if (was != (this->consec_fail_ == 0) || this->consec_ok_ == 1 || this->consec_fail_ == 1) this->publish_status_();
+}
+
+void DhcpFailover::probe_loop_() {
+  bool dns = this->probe_mode_ == PROBE_DNS;
+  if (this->prb_ < 0) {
+    this->prb_ = dns ? udp_sock(0, false) : udp_sock(68, true);  // reserved via consume_sockets
+    if (this->prb_ < 0) return;
+  }
+  if (dns) this->probe_recv_dns_();
+  else this->probe_recv_dhcp_();
+  if (this->probe_waiting_) {
+    if (millis() - this->probe_sent_ms_ > (dns ? this->probe_dns_timeout_ms_ : PROBE_TIMEOUT_MS))
+      this->probe_done_(false, dns ? "timeout" : "no OFFER");
+  } else if (!this->probe_ever_ || millis() - this->last_probe_ms_ >= this->next_probe_ms_) {
+    if (dns && this->probe_dns_server_ == this->self_ip_) {  // would ask ourselves; refuse
+      this->last_probe_ms_ = millis();
+      this->next_probe_ms_ = this->probe_max_ms_;
+      ESP_LOGE(TAG, "probe_dns_server is this device (%s); not probing", ip_str(this->self_ip_).c_str());
+      return;
+    }
+    this->probe_ever_ = true;
+    if (dns) this->send_dns_probe_();
+    else this->send_probe_();
   }
 }
 
